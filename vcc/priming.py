@@ -38,15 +38,49 @@ def _note(text: str) -> str:
     return text
 
 
+def _stamp_turn_clock(agent: Any) -> bool:
+    """Give a prologue-less caller the turn clock ``build_api_messages`` insists on.
+
+    Core freezes ``agent._current_turn_timestamp`` at turn admission and reads it unconditionally
+    (agent/turn_context.py:1273) as the expiry clock for replay canonicalization, by design
+    failing any caller that skipped the turn prologue. A prime is exactly such a caller — that
+    is why the payload route logged ``AttributeError: 'AIAgent' object has no attribute
+    '_current_turn_timestamp'`` on every compaction until 2026-10-26 15:35 and warmed a raw-history
+    approximation instead of the real wire copy. A prime calls with ``current_turn_user_idx=None``,
+    so the canonicalized range is empty and the clock value cannot change a byte of *its* payload,
+    which is what makes a stand-in safe here and only here. Returns whether this call created the
+    slot, so it can be handed back: a live turn's frozen clock must never be overwritten.
+    """
+    if hasattr(agent, "_current_turn_timestamp"):
+        return False
+    try:
+        agent._current_turn_timestamp = time.time()
+        return True
+    except Exception:
+        # A read-only agent just degrades to the fallback route.
+        return False
+
+
+def _release_turn_clock(agent: Any, stamped: bool) -> None:
+    if stamped:
+        try:
+            del agent._current_turn_timestamp
+        except Exception:
+            # Nothing downstream depends on the slot being gone.
+            pass
+
+
 def wire_payload(agent: Any, messages: list, system_prompt: Optional[str]) -> tuple[list, str]:
     """The wire copy the NEXT turn will send, minus the user message it has not received yet.
 
     Hermes builds the request copy per turn (`turn_context.build_api_messages`) and replays
     historical rows from their `api_content` sidecars precisely so the prefix stays
     byte-stable — which is what makes a prime reusable at all. Outside a turn some of the
-    prologue inputs are absent, so this degrades to `system + history` rather than failing:
-    a slightly shorter prime still warms the part it covers.
+    prologue inputs are absent, so this borrows the turn clock (see `_stamp_turn_clock`) and
+    still degrades to `system + history` rather than failing: a slightly shorter prime still
+    warms the part it covers.
     """
+    stamped = _stamp_turn_clock(agent)
     try:
         api_messages, effective_system = agent_build_api_messages(
             agent, list(messages), current_turn_user_idx=None, ext_prefetch_cache=None,
@@ -58,6 +92,8 @@ def wire_payload(agent: Any, messages: list, system_prompt: Optional[str]) -> tu
         system = system_prompt or getattr(agent, "_cached_system_prompt", "") or ""
         wire = ([{"role": "system", "content": system}] if system else []) + list(messages)
         return wire, f"fallback raw history ({type(exc).__name__}: {exc})"
+    finally:
+        _release_turn_clock(agent, stamped)
 
 
 def agent_build_api_messages(*args: Any, **kwargs: Any):

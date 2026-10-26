@@ -453,3 +453,40 @@ def test_a_turn_starting_during_the_wait_abandons_the_warm(monkeypatch):
                   sender=lambda *a, **kw: pytest.fail("a stale prefix must not be warmed"),
                   sleep=_moving_sleep, block=True)
     assert priming.PRIMES["sent"] == 0 and "history changed" in priming.PRIMES["last"]
+
+
+def test_a_prime_borrows_the_turn_clock_it_was_never_given(monkeypatch):
+    """agent/turn_context.py:1273 reads agent._current_turn_timestamp unconditionally and fails a
+    caller that skipped the turn prologue - which is every prime, hence the AttributeError that put
+    every payload on the raw-history route up to 2026-10-26 15:35. The clock must be borrowed, not
+    kept, and must never overwrite a live turn's frozen value."""
+    seen: list = []
+
+    def _builder(agent, messages, **kw):
+        seen.append(getattr(agent, "_current_turn_timestamp", None))
+        return [{"role": "user", "content": "x"}], "S"
+
+    monkeypatch.setattr(priming, "agent_build_api_messages", _builder)
+    agent = _Agent(_msgs(2))
+
+    _, route = priming.wire_payload(agent, agent.messages, "S")
+    assert route == "build_api_messages", "the real wire copy, not the raw-history fallback"
+    assert isinstance(seen[0], float), "the builder got a clock"
+    assert not hasattr(agent, "_current_turn_timestamp"), "a borrowed clock must be handed back"
+
+    agent._current_turn_timestamp = 12345.0
+    priming.wire_payload(agent, agent.messages, "S")
+    assert seen[1] == 12345.0 and agent._current_turn_timestamp == 12345.0, "a live turn owns its clock"
+
+
+def test_a_broken_builder_still_degrades_to_raw_history(monkeypatch):
+    """The borrowed clock must not swallow real builder failures: they still degrade to the
+    documented fallback, and the slot is still returned."""
+    def _boom(agent, messages, **kw):
+        raise RuntimeError("plugin manager exploded")
+
+    monkeypatch.setattr(priming, "agent_build_api_messages", _boom)
+    agent = _Agent([{"role": "user", "content": "q"}])
+    wire, route = priming.wire_payload(agent, agent.messages, "S")
+    assert route.startswith("fallback raw history (RuntimeError") and wire[0]["role"] == "system"
+    assert not hasattr(agent, "_current_turn_timestamp")
