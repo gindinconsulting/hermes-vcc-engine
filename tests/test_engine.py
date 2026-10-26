@@ -117,6 +117,25 @@ def test_session_without_user_turns_uses_hermes_sentinel(no_llm, cc):
     assert no_llm == []
 
 
+def _stub_leg_llm(monkeypatch, text_or_fn, finish="stop", seen=None):
+    """Adapt a summariser stub to the leg\'s OWN wire call (``vcc.engine.call_llm``).
+
+    The leg stopped going through core\'s ``_generate_summary``: it issues its own
+    ``call_llm(task="compression", messages=[...], max_tokens=...)``, so a stub now sees wire
+    kwargs and has to answer with a completion.
+    """
+    import engine
+
+    def _call(**kwargs):
+        if seen is not None:
+            seen.append(kwargs)
+        prompt = kwargs["messages"][0]["content"]
+        text = text_or_fn(prompt) if callable(text_or_fn) else text_or_fn
+        return {"choices": [{"message": {"content": text}, "finish_reason": finish}]}
+
+    monkeypatch.setattr(engine, "call_llm", _call)
+
+
 # ----------------------------------------------------------------------------- fallbacks
 
 def test_projection_error_falls_back_to_stock_llm_summary(monkeypatch, cc):
@@ -400,6 +419,50 @@ def test_conclusions_material_is_prose_only_and_bounded():
     assert all("tool_calls" not in m for m in material)     # tool traffic never reaches the leg
 
 
+def test_conclusion_rows_are_prose_sized_not_excerpt_sized():
+    """The leg reads judgement; judgement needs the reply, not a 1,200-char excerpt of it."""
+    import projector
+
+    reply = "Verdict: the contributor pool is concentrated in the vendors.\n\n" + "\n".join(
+        f"| niche {i} | LiveKit | 58% |" for i in range(120))
+    turns = [{"role": "system", "content": "You are Hermes."}, user("what did the numbers say?"),
+             assistant(reply)]
+    rows = projector.assistant_prose(turns)
+    assert len(rows[0]["content"]) > 1200, "prose rows were still cut to the log-excerpt length"
+    assert "\n" in rows[0]["content"], "markdown structure must survive into the leg's input"
+    material = projector.conclusions_material(turns, budget_chars=36_000)
+    assert material[0]["content"] == rows[0]["content"]
+
+
+def test_thin_prose_window_declines_the_llm_call(monkeypatch, no_llm):
+    """Two truncated excerpts cannot sustain a ten-section digest: decline, do not reconstruct."""
+    import engine
+
+    calls: list[dict] = []
+    _stub_leg_llm(monkeypatch, "confidently reconstructed from almost nothing", seen=calls)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    text = eng._generate_summary(_prose_session(rounds=2))
+    assert calls == [], "a thin window must not spend the summary call"
+    assert "## What the Agent Concluded" not in text
+    assert "confidently reconstructed" not in text
+
+
+def test_digest_is_capped_to_the_prose_it_read(monkeypatch, no_llm):
+    """Digestion compresses: a section longer than the prose it read is filler, not memory."""
+    import engine
+    import projector
+
+    _stub_leg_llm(monkeypatch, "the plan stands, the guard is environmental. " * 1200)  # ~62k chars
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    turns = _prose_session()
+    text = eng._generate_summary(turns)
+    assert "## What the Agent Concluded" in text
+    section = text.split("## What the Agent Concluded", 1)[1].strip()
+    prose = sum(len(m["content"]) for m in projector.conclusions_material(turns, budget_chars=36_000))
+    assert prose >= eng._vcc_options["conclusions_min_input_chars"]
+    assert len(section) <= max(1600, prose) + 200, f"digest inflated {prose} chars of prose to {len(section)}"
+
+
 def test_conclusions_leg_defaults_off_and_costs_no_llm(no_llm):
     eng = make_engine()
     assert eng._vcc_options["preserve_conclusions"] is False
@@ -411,19 +474,15 @@ def test_conclusions_leg_defaults_off_and_costs_no_llm(no_llm):
 def test_conclusions_leg_appends_the_digest(monkeypatch, no_llm):
     import engine
 
-    seen: dict[str, int] = {}
-
-    def fake_llm_summary(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
-        seen["turns"] = len(turns)
-        return "Decided the failing tests were an environment guard, not a regression."
-
-    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", fake_llm_summary)
+    seen: list[dict] = []
+    _stub_leg_llm(monkeypatch, "Decided the failing tests were an environment guard, not a regression.",
+                  seen=seen)
     eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
     eng._vcc_trigger = {"manual": True, "focus": None, "at": "2026-01-01 00:00:00"}
     text = eng._generate_summary(_prose_session())
     assert "## What the Agent Concluded" in text
     assert "environment guard" in text
-    assert seen["turns"] > 0
+    assert seen and "folded window" in seen[0]["messages"][0]["content"]
     # the trigger line stops claiming "no LLM call" once the hybrid leg ran
     assert "one bounded summary-model call" in text
 
@@ -433,10 +492,7 @@ def test_conclusions_leg_strips_the_stock_handoff_banner(monkeypatch, no_llm):
     import agent.context_compressor as cc
     import engine
 
-    def llm_with_banner(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
-        return cc.SUMMARY_PREFIX + "\nThe guard failures were environmental; the patch stands."
-
-    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", llm_with_banner)
+    _stub_leg_llm(monkeypatch, cc.SUMMARY_PREFIX + "\nThe guard failures were environmental; the patch stands.")
     eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
     text = eng._generate_summary(_prose_session())
     assert "the patch stands" in text
@@ -452,13 +508,18 @@ def test_conclusions_leg_refuses_hermess_structural_fallback(monkeypatch, no_llm
     """
     import engine
 
-    def structural(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
-        self._last_summary_error = ("summary model stalled on every route; "
-                                    "deterministic fallback summary inserted")
-        return "## Historical Task Snapshot None. # Detailed Session Log (oldest first) …"
+    box: dict[str, object] = {}
 
-    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", structural)
+    def structural(**kwargs):
+        box["eng"]._last_summary_error = ("summary model stalled on every route; "
+                                          "deterministic fallback summary inserted")
+        return {"choices": [{"message": {"content":
+                    "## Historical Task Snapshot None. # Detailed Session Log (oldest first) …"},
+                    "finish_reason": "stop"}]}
+
+    monkeypatch.setattr(engine, "call_llm", structural)
     eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    box["eng"] = eng
     eng._vcc_trigger = {"manual": True, "focus": None, "at": "2026-01-01 00:00:00"}
     text = eng._generate_summary(_prose_session())
     assert "## What the Agent Concluded" not in text
@@ -469,11 +530,64 @@ def test_conclusions_leg_refuses_hermess_structural_fallback(monkeypatch, no_llm
 def test_conclusions_leg_failure_ships_the_deterministic_handoff(monkeypatch, no_llm):
     import engine
 
-    def explode(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
+    def explode(**kwargs):
         raise RuntimeError("aux model is down")
 
-    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", explode)
+    monkeypatch.setattr(engine, "call_llm", explode)
     eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
     text = eng._generate_summary(_prose_session())
     assert "## What the Agent Concluded" not in text
     assert "## Detailed Session Log" in text  # the projection still shipped
+
+
+def test_the_leg_caps_its_own_wire(monkeypatch):
+    """32.8 s of the 10:30:27 leg was decoding 4,434 tokens we then trimmed to 1,200. The leg now
+    issues its OWN call with a wire cap: core's "NO max_tokens" rule protects the whole-handoff
+    summary, not a section we post-trim with the most-important bullets first."""
+    seen: list[dict] = []
+    _stub_leg_llm(monkeypatch, "- the guard is environmental; leave aggressive", seen=seen)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    text = eng._generate_summary(_prose_session())
+
+    kwargs = seen[0]
+    assert kwargs["task"] == "compression"
+    assert kwargs["max_tokens"] == 1600                       # ~1.3x the 1,200-token keep-cap
+    # ...and in extra_body, because the aux client DROPS a top-level max_tokens on a local
+    # custom route (measured: request_max_tokens=None, 9,543 tokens generated).
+    body = kwargs["extra_body"]
+    assert body.get("max_tokens") == 1600 or body.get("max_completion_tokens") == 1600, body
+    # thinking off: with a cap and thinking on, this model burned all 1,600 tokens on reasoning
+    # and returned finish_reason=length with an empty message.content (no section at all)
+    assert body["reasoning"] == {"effort": "none"}, body
+    assert body["chat_template_kwargs"] == {"reasoning_effort": "none"}, body
+    assert kwargs["main_runtime"]["model"] == eng.model       # route inherited unless a suffix pins it
+    content = kwargs["messages"][0]["content"]
+    assert "at most 900 tokens" in content                     # the keep-cap IS the ask
+    assert "no heading, no preamble" in content                # the stock skeleton is gone
+    assert "the guard is environmental" in text
+
+
+def test_wire_cap_is_configurable_and_zero_uncaps(monkeypatch):
+    seen: list[dict] = []
+    _stub_leg_llm(monkeypatch, "- decided: keep the guard", seen=seen)
+    off = make_engine(config={"context": {"vcc": {"preserve_conclusions": True,
+                                                 "conclusions_wire_tokens": 0}}})
+    off._generate_summary(_prose_session())
+    assert "max_tokens" not in seen[0], seen[0]
+
+    tuned = make_engine(config={"context": {"vcc": {"conclusions_wire_tokens": "800"}}})
+    assert tuned._vcc_options["conclusions_wire_tokens"] == 800
+    big = make_engine(config={"context": {"vcc": {"conclusions_wire_tokens": 99999}}})
+    assert big._vcc_options["conclusions_wire_tokens"] == 8000
+
+
+def test_a_length_stop_at_the_cap_is_not_a_failure(monkeypatch):
+    """Core raises on ``finish_reason=length`` because a length-stopped handoff is a partial
+    memory. For this section a stop at our own cap is expected: the trim keeps the head."""
+    _stub_leg_llm(monkeypatch, "- decided: keep the guard\n- blocked: nothing", finish="length")
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    text = eng._generate_summary(_prose_session())
+
+    assert "## What the Agent Concluded" in text
+    assert "keep the guard" in text
+    assert "no LLM call" not in text

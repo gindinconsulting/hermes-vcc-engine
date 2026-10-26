@@ -1,0 +1,330 @@
+"""Post-compaction prefix priming — spend the reading window, not the next keystroke.
+
+A compaction rewrites the whole history, so the next model call has no cached prefix to
+reuse. Measured on a live session (oMLX, 2026-10-26): the first call after a manual
+`/compress` took **12.16 s to first token on a 38,108-token prompt**, against **0.35-2.38 s
+for every other call that hour, including one on 74,292 tokens**. The model had not cooled —
+idle eviction is off and it had decoded 1,845 tokens 31 seconds earlier — the *prefix* was
+new. 38,108 / 12.16 s is ~3.1k tok/s of cold prefill, and an operator reading the handoff
+banner pays all of it later, on their next message.
+
+So fire one tiny request over the payload the next turn will send, the moment a compaction
+commits. Providers that cache by prefix (oMLX: `cache.enabled` plus an SSD tier, and
+`preserve_mid_system_cache`) then hold those KV blocks and the real turn prefills only its
+delta. If the operator already sent that turn, skip: a prefill queued *ahead* of a live
+request would make it slower, not faster.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import time
+import urllib.request
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger("hermes_plugins.hermes_vcc_engine.priming")
+
+# Counters for tests and for a future telemetry line; `last` is the last decision, verbatim.
+PRIMES: dict[str, Any] = {"installs": 0, "sent": 0, "skipped": 0, "errors": 0, "last": ""}
+_INSTALLED: dict[str, Any] = {"wrapper": None, "original": None}
+
+
+def _note(text: str) -> str:
+    PRIMES["last"] = text
+    return text
+
+
+def wire_payload(agent: Any, messages: list, system_prompt: Optional[str]) -> tuple[list, str]:
+    """The wire copy the NEXT turn will send, minus the user message it has not received yet.
+
+    Hermes builds the request copy per turn (`turn_context.build_api_messages`) and replays
+    historical rows from their `api_content` sidecars precisely so the prefix stays
+    byte-stable — which is what makes a prime reusable at all. Outside a turn some of the
+    prologue inputs are absent, so this degrades to `system + history` rather than failing:
+    a slightly shorter prime still warms the part it covers.
+    """
+    try:
+        api_messages, effective_system = agent_build_api_messages(
+            agent, list(messages), current_turn_user_idx=None, ext_prefetch_cache=None,
+            plugin_user_context=None, moa_config=None, active_system_prompt=system_prompt)
+        if effective_system and not (api_messages and api_messages[0].get("role") == "system"):
+            api_messages = [{"role": "system", "content": effective_system}] + list(api_messages)
+        return list(api_messages), "build_api_messages"
+    except Exception as exc:  # noqa: BLE001 - a degraded prime beats none
+        system = system_prompt or getattr(agent, "_cached_system_prompt", "") or ""
+        wire = ([{"role": "system", "content": system}] if system else []) + list(messages)
+        return wire, f"fallback raw history ({type(exc).__name__}: {exc})"
+
+
+def agent_build_api_messages(*args: Any, **kwargs: Any):
+    from agent.turn_context import build_api_messages
+
+    return build_api_messages(*args, **kwargs)
+
+
+def _base_model(model: Any) -> str:
+    return str(model or "").split(":")[0].strip().lower()
+
+
+def _admin_key(explicit: Any) -> str:
+    """Bearer for the engine admin API: config value, then env, then oMLX's own settings file."""
+    for value in (explicit, os.environ.get("OMLX_ADMIN_KEY")):
+        if value:
+            return str(value).strip()
+    try:
+        with open(os.path.expanduser("~/.omlx/settings.json"), "r", encoding="utf-8") as fh:
+            return str((json.load(fh).get("auth") or {}).get("api_key") or "").strip()
+    except Exception:  # noqa: BLE001 - a missing key just means an unauthenticated probe
+        return ""
+
+
+def _queued_requests(payload: Any) -> int:
+    """How many requests the engine says it is running or holding; -1 if the shape is unknown."""
+    active = payload.get("active_models") if isinstance(payload, dict) else None
+    if not isinstance(active, dict):
+        return -1
+    total = sum(active[k] for k in ("total_active_requests", "total_waiting_requests")
+                if isinstance(active.get(k), int))
+    if total == 0:  # some builds report per-engine instead of totals
+        for engine in active.values():
+            if isinstance(engine, dict):
+                total += sum(engine[k] for k in ("active_requests", "waiting_requests", "queued_requests")
+                             if isinstance(engine.get(k), int))
+    return total
+
+
+def _engine_busy(opts: dict[str, Any], opener: Callable[..., Any] = urllib.request.urlopen) -> str:
+    """``""`` when the serving engine looks idle; a reason string when a request is queued.
+
+    The queue we must not join is the *engine's*, and message-count staleness cannot see it. At
+    09:50:39 on 2026-10-26 the prime fired 1.1 s after a compaction committed while the operator's
+    turn had been in flight for 38 ms: both requests carried the same 25 messages, so the length
+    check passed and two prefills of one 38k-token prefix fought each other — the prime took
+    1 token in 59.49 s and the turn's first token came at 21.04 s (32.7 tok/s, against 100.3 tok/s
+    on the call before it). An unreachable probe counts as busy: skipping a warm-up costs us the
+    pre-priming status quo, joining a live prefill costs the operator their turn.
+    """
+    url = str(opts.get("warm_after_compaction_idle_probe") or "").strip()
+    if not url:
+        return ""  # no probe configured: unknown backend, behave as before priming existed
+    key = _admin_key(opts.get("warm_after_compaction_idle_probe_key"))
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with opener(request, timeout=float(opts.get("warm_after_compaction_probe_timeout_s", 0.5))) as resp:
+            payload = json.load(resp)
+    except Exception as exc:  # noqa: BLE001 - unreachable engine is a skip, not a crash
+        return f"engine idle probe unreachable ({type(exc).__name__})"
+    queued = _queued_requests(payload)
+    if queued < 0:
+        return "engine idle probe returned an unrecognised shape"
+    return f"engine busy: {queued} request(s) active or waiting" if queued else ""
+
+
+def _looks_stale(agent: Any, baseline: int) -> str:
+    """Best-effort: has a turn already been admitted on top of what we primed for?"""
+    if getattr(agent, "_active_compression_commit_fence", None):
+        return "another compaction is in flight"
+    live = getattr(agent, "messages", None)
+    if isinstance(live, list) and len(live) != baseline:
+        return f"history changed {baseline} -> {len(live)} (a turn started first)"
+    return ""
+
+
+def _session_route(agent: Any) -> tuple[Any, str, str]:
+    """The client the next turn answers with — a last resort, not the first choice.
+
+    A KV cache belongs to one model instance, so the prime has to land on the instance that
+    answers, and the compression task is routinely configured to a different profile than the
+    session model. But the client the agent object carries is a PER-REQUEST one
+    (`run_agent.py` sets `self.client = None` and `chat_completion_helpers` swaps a live client
+    in only for the duration of a request, closing it at turn end), so a prime sent on it can be
+    torn off mid-flight by `agent_close` — measured on this box at 09:09:51, 17 s after the prime
+    went out, with the response lost and the failure visible only at DEBUG. The auxiliary route
+    is a module-cached client with no turn lifecycle, so it is preferred whenever it resolves to
+    the same model; this one is kept for a Hermes build with no compression task configured.
+    """
+    model = str(getattr(agent, "model", "") or getattr(agent, "_model", "") or "")
+    for attr in ("client", "_client", "_chat_client"):
+        candidate = getattr(agent, attr, None)
+        completions = getattr(getattr(candidate, "chat", None), "completions", None)
+        if model and callable(getattr(completions, "create", None)):
+            return candidate, model, f"agent.{attr}"
+    return None, model, ""
+
+
+def _aux_route(session_model: str) -> tuple[Any, str, str]:
+    """The configured compression client — first choice when it *is* the session model."""
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, aux_model = get_text_auxiliary_client("compression")
+    except Exception:  # noqa: BLE001 - no aux route is a skip, never a failure
+        return None, "", ""
+    if client is None:
+        return None, "", ""
+    if _base_model(aux_model) != _base_model(session_model):
+        return None, "", (f"aux model {aux_model} is not the session model {session_model}")
+    return client, session_model, "aux:compression"
+
+
+def send_prime(opts: dict[str, Any], wire: list, model: str, client: Any = None,
+               tools: Optional[list] = None) -> None:
+    """One non-streaming, single-token completion over `wire` — a prefill, not an answer.
+
+    `client` is the instance that will serve the next turn; with none given this falls back to
+    the compression auxiliary route, which is only correct when it resolves to the same model.
+    """
+    if client is None:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, aux_model = get_text_auxiliary_client("compression")
+        if client is None:
+            raise RuntimeError("no auxiliary client resolved for the compression task")
+        model = model or aux_model or ""
+    kwargs: dict[str, Any] = {
+        "model": model, "messages": wire,
+        "max_tokens": int(opts["warm_after_compaction_max_tokens"]), "stream": False,
+    }
+    # Tool schemas are rendered INTO the prompt, so a prime without them prefills a token
+    # sequence the following turn does not share. Measured 2026-10-26 10:01:38 → 10:03:05: the
+    # prime was 31,050 tokens, the operator's turn 38,983 with `cached 6,592` — only the system
+    # prompt overlapped, TTFT 13.9s where a warm turn-to-turn call gets 0.9s (splash log). The
+    # live call sends `tools=agent.tools` (agent/chat_completion_helpers.py:1528), so must this.
+    if tools:
+        kwargs["tools"] = tools
+    try:
+        from agent.auxiliary_client import get_auxiliary_extra_body
+
+        extra = get_auxiliary_extra_body()
+        if extra:
+            kwargs["extra_body"] = extra
+    except Exception:  # noqa: BLE001 - extra_body is provider decoration, never the point
+        pass
+    client.chat.completions.create(**kwargs)
+
+
+def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dict[str, Any],
+          sender: Optional[Callable[..., None]] = None,
+          sleep: Callable[[float], None] = time.sleep, block: bool = False) -> str:
+    """Warm the next turn's prefix on a daemon thread. Returns the decision, never raises.
+
+    ``block=True`` runs the sequence inline instead of on a thread, for tests and for a
+    caller that wants the decision rather than the fire-and-forget.
+    """
+    sender = sender or send_prime
+    baseline = len(messages)
+    started = time.perf_counter()
+
+    def _run() -> None:
+        try:
+            delay = float(opts["warm_after_compaction_delay_s"])
+            if delay > 0:
+                sleep(delay)
+            stale = _looks_stale(agent, baseline)
+            if stale:
+                PRIMES["skipped"] += 1
+                logger.info("vcc: prefix prime skipped (%s)", _note(stale))
+                return
+            busy = _engine_busy(opts)
+            if busy:
+                PRIMES["skipped"] += 1
+                logger.info("vcc: prefix prime skipped (%s)", _note(busy))
+                return
+            session_model = getattr(agent, "model", "") or getattr(agent, "_model", "")
+            wire, payload_route = wire_payload(agent, messages, system_prompt)
+            client, model, route = _aux_route(str(session_model))
+            aux_why = "" if client is not None else route  # route slot carries the refusal reason
+            if client is None:
+                # No configured compression task on this build: the agent's own client is the
+                # only route left, lifecycle risk and all (see _session_route).
+                client, model, route = _session_route(agent)
+            if client is None:
+                PRIMES["skipped"] += 1
+                why = aux_why or "no client reachable"
+                logger.info("vcc: prefix prime skipped (%s)", why)
+                _note(f"skipped: {why}")
+                return
+            sender(opts, wire, model, client=client,
+                   tools=(getattr(agent, "tools", None) or None))
+            PRIMES["sent"] += 1
+            payload_chars = sum(len(str(m.get("content") or "")) for m in wire)
+            elapsed = (time.perf_counter() - started) * 1000
+            logger.info("vcc: prefix primed: %d wire messages / %d chars via %s on %s in %.0f ms "
+                        "(the next call prefills only its delta)",
+                        len(wire), payload_chars, f"{route}+{payload_route}", model, elapsed)
+            _note(f"primed {len(wire)} messages / {payload_chars} chars via {route}+{payload_route}")
+            # A prefill only helps if the operator's next message arrives after it. Re-checking
+            # afterwards catches the case that cost latency on this box at 09:09:57: the prime was
+            # still prefilling 41k tokens when the turn landed, so the turn queued behind it
+            # (20.95 s time-to-first-token, against 15.06 s with no prime at all).
+            overlapped = _looks_stale(agent, baseline)
+            if overlapped:
+                logger.warning("vcc: prefix prime overlapped a live turn (%s after %0.f ms of prefill); "
+                               "the next message queued behind it rather than ahead of it",
+                               _note(overlapped), elapsed)
+        except Exception as exc:  # noqa: BLE001 - priming is a bonus, never a dependency
+            PRIMES["errors"] += 1
+            logger.warning("vcc: prefix prime failed (%s: %s); the next turn prefills cold",
+                           type(exc).__name__, exc)
+            _note(f"error: {type(exc).__name__}: {exc}")
+
+    if block:
+        _run()
+        return PRIMES["last"]
+    thread = threading.Thread(target=_run, name="vcc-prefix-prime", daemon=True)
+    thread.start()
+    return _note(f"scheduled {baseline} messages")
+
+
+def install(opts: dict[str, Any]) -> None:
+    """Wrap `conversation_compression.compress_context` once per process. Fail-open.
+
+    The load-bearing detail: `compression_facade.py` imports `compress_context` *inside* the
+    calling function, so replacing the module attribute is picked up on the very next call.
+    Any exception inside the wrapper leaves compaction exactly as Hermes wrote it.
+    """
+    if _INSTALLED["wrapper"] is not None or not opts.get("warm_after_compaction", True):
+        return
+    import agent.conversation_compression as cc
+
+    original = getattr(cc, "compress_context", None)
+    if not callable(original):
+        logger.info("vcc: prefix priming unavailable (no compress_context in this Hermes build)")
+        _note("unavailable: no compress_context")
+        return
+    if getattr(original, "__vcc_prime_wrap__", False):
+        _INSTALLED["wrapper"] = original
+        return
+
+    def wrapper(agent: Any, messages: list, system_message: str, *args: Any, **kwargs: Any):
+        result = original(agent, messages, system_message, *args, **kwargs)
+        try:
+            if isinstance(result, tuple) and len(result) == 2:
+                new_messages, new_system = result
+                if isinstance(new_messages, list) and len(new_messages) < len(messages):
+                    prime(agent, new_messages, new_system, opts=opts)
+        except Exception as exc:  # noqa: BLE001
+            PRIMES["errors"] += 1
+            logger.warning("vcc: prime scheduling skipped (%s: %s)", type(exc).__name__, exc)
+        return result
+
+    wrapper.__name__ = getattr(original, "__name__", "compress_context")
+    wrapper.__doc__ = getattr(original, "__doc__", "")
+    setattr(wrapper, "__vcc_prime_wrap__", True)
+    cc.compress_context = wrapper
+    _INSTALLED.update({"wrapper": wrapper, "original": original})
+    PRIMES["installs"] += 1
+    logger.info("vcc: post-compaction prefix priming installed (delay %ss, max_tokens %s)",
+                opts["warm_after_compaction_delay_s"], opts["warm_after_compaction_max_tokens"])
+
+
+def uninstall() -> None:
+    """Restore the wrapped function (tests, and a config flip to false)."""
+    if _INSTALLED["original"] is not None:
+        import agent.conversation_compression as cc
+
+        cc.compress_context = _INSTALLED["original"]
+    _INSTALLED.update({"wrapper": None, "original": None})

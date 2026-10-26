@@ -378,3 +378,33 @@ def test_control_characters_split_into_hard_and_whitespace():
     for ch in _ALL_CHARS:
         if p._HARD_CTRL_RE.match(ch):
             assert ord(ch) in p._CTRL_TABLE, repr(ch)
+
+
+def test_assistant_prose_cap_default_is_900():
+    """Raised from 400 on 2026-10-26. Measured on the 10:01:37 compaction: a ~4,000-char answer
+    reached the handoff as head + tail with the cut landing mid-word ("…p it to 'balanced'"),
+    so a decision stated inside a long reply lost the argument for it. 900 chars costs roughly
+    +2,200 tokens per compaction (~7%) and needs no LLM call."""
+    assert p.Limits().assistant_chars == 900
+
+
+def test_char_caps_come_from_config_and_survive_bad_values():
+    assert p.limits_from_opts({"projection_char_caps": {"assistant": 1200}}).assistant_chars == 1200
+    lim = p.limits_from_opts({"projection_char_caps": {"user": "300", "assistant": "lots", "nope": 9}})
+    assert lim.user_chars == 300, lim                       # strings parse
+    assert lim.assistant_chars == 900, lim                  # unparsable keeps the default
+    assert p.limits_from_opts({}).assistant_chars == 900
+    assert p.limits_from_opts({"projection_char_caps": "not a mapping"}).assistant_chars == 900
+    assert p.limits_from_opts({"projection_char_caps": {"assistant": 5}}).assistant_chars == 40
+
+
+def test_the_raised_cap_keeps_more_of_a_long_reply():
+    body = " ".join(f"sentinel{i:03d}" for i in range(60))   # ~600 chars spread end to end
+    turns = [user("verdict?"), assistant(body)]
+    keep = lambda out: sum(1 for i in range(60) if f"sentinel{i:03d}" in out)
+
+    loose = p.project(turns, budget_chars=8000)
+    tight = p.project(turns, budget_chars=8000, limits=p.Limits(assistant_chars=400))
+
+    assert keep(loose) == 60, keep(loose)         # the new default carries it whole
+    assert keep(tight) < 60, keep(tight)          # the old cap cut into it

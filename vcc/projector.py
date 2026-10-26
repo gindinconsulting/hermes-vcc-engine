@@ -56,7 +56,10 @@ class Limits:
     """Per-item character caps. Small on purpose: every compacted line can be expanded later."""
 
     user_chars: int = 600
-    assistant_chars: int = 400
+    assistant_chars: int = 900  # 400 until 2026-10-26: a decision stated inside a long reply
+    # lost its middle. Measured on the 10:01:37 compaction — a ~4,000-char answer reached the
+    # handoff as head + tail with the cut landing mid-word ("…p it to 'balanced'"). 900 costs
+    # roughly +2,200 tokens per compaction (~7%) and buys the argument back without an LLM.
     call_chars: int = 160
     result_chars: int = 160
     error_chars: int = 600
@@ -68,6 +71,34 @@ class Limits:
     max_fixes: int = 12
     max_error_names: int = 20
     earlier_share: float = 0.15  # max share of the budget an inherited non-vcc summary may keep
+
+
+_CAP_FIELDS = {
+    "user": "user_chars", "assistant": "assistant_chars", "call": "call_chars",
+    "result": "result_chars", "error": "error_chars", "goal": "goal_chars", "task": "task_chars",
+}
+
+
+def limits_from_opts(opts: Mapping[str, Any]) -> Limits:
+    """`context.vcc.projection_char_caps` over the dataclass defaults.
+
+    Permissive on purpose: a compaction must not die on a typo in config, so unknown keys are
+    ignored, unparsable values keep the default for that cap, and everything is clamped to a
+    sane band. A cap that is too large is a size problem, never a correctness one.
+    """
+    caps = opts.get("projection_char_caps") or {}
+    if not isinstance(caps, Mapping):
+        return Limits()
+    over: dict[str, int] = {}
+    for name, field in _CAP_FIELDS.items():
+        raw = caps.get(name)
+        if raw is None:
+            continue
+        try:
+            over[field] = max(40, min(int(raw), 20_000))
+        except (TypeError, ValueError):
+            continue  # unparsable: keep this cap's default rather than fail the compaction
+    return Limits(**over) if over else Limits()
 
 
 # --------------------------------------------------------------------------------------
@@ -123,6 +154,39 @@ def clean(text: str, limit: int) -> str:
     if "`" in text:
         text = text.replace("`", "'")
     return elide(" ".join(text.split()), limit)
+
+
+_TRAIL_WS_RE = re.compile(r"[ \t]+$", re.MULTILINE)
+_BLANK_RUN_RE = re.compile(r"\n{3,}")
+
+
+def clean_multiline(text: str, limit: int) -> str:
+    """``clean`` for PROSE: the same sanitising, the line structure intact.
+
+    ``clean`` exists to squeeze an untrusted blob (a tool result, a log tail) into one safe line, and
+    ``" ".join(text.split())`` is the step that does it. Run on a narrative digest that step costs
+    0.3% of the characters (measured over 44 markdown replies in this profile) and it is the entire
+    bullet list, heading tree and step numbering — so the summariser's own structure is the thing
+    being paid 0.3% to throw away. This variant keeps line breaks, caps blank runs at one line, and
+    still drops ANSI, angle/square markers, backticks and nested headings.
+    """
+    if not text:
+        return ""
+    window = limit * 2 + 64
+    if len(text) > window * 2:
+        text = text[:window] + " … " + text[-window:]
+    if "\x1b" in text:
+        text = _ANSI_RE.sub("", text)
+    if "<" in text or "[" in text:
+        text = _MARKER_RE.sub("[marker]", text)
+    if not text.isprintable() and _HARD_CTRL_RE.search(text):
+        text = text.translate(_CTRL_TABLE)
+    if "##" in text:
+        text = _HEADING_RE.sub("#", text)
+    if "`" in text:
+        text = text.replace("`", "'")
+    text = _BLANK_RUN_RE.sub("\n\n", _TRAIL_WS_RE.sub("", text))
+    return elide("\n".join(ln for ln in text.split("\n") if ln.strip()), limit)
 
 
 def elide(text: str, limit: int) -> str:
@@ -828,12 +892,18 @@ def iter_refs(summary: str) -> Iterable[int]:
         yield int(match.group(1))
 
 
-def assistant_prose(turns: Iterable[Mapping[str, Any]], *, row_limit: int = 1200) -> list[dict[str, Any]]:
+CONCLUSIONS_ROW_LIMIT = 6000  # prose-sized on purpose; see conclusions_material
+
+
+def assistant_prose(turns: Iterable[Mapping[str, Any]], *, row_limit: int = CONCLUSIONS_ROW_LIMIT) -> list[dict[str, Any]]:
     """Assistant turns worth a conclusions digest — judgement, not tool-call chatter.
 
     A conclusion lives in the text the agent wrote *around* its tool calls, so tool-result
     bodies are excluded outright: that exclusion is what makes the hybrid leg's input a
     fraction of a full summary's. Turns shorter than a sentence carry nothing to preserve.
+
+    Rows go through ``clean_multiline``, not ``clean``: this is narrative markdown (verdicts,
+    numbered findings, tables) and flattening it to one line is what the leg was built to keep.
     """
     out: list[dict[str, Any]] = []
     for turn in turns or ():
@@ -842,17 +912,23 @@ def assistant_prose(turns: Iterable[Mapping[str, Any]], *, row_limit: int = 1200
         text = strip_think(content_text(turn.get("content")))
         if len(text) < 80:
             continue
-        out.append({"role": "assistant", "content": clean(text, row_limit)})
+        out.append({"role": "assistant", "content": clean_multiline(text, row_limit)})
     return out
 
 
-def conclusions_material(turns: Iterable[Mapping[str, Any]], *, budget_chars: int) -> list[dict[str, Any]]:
+def conclusions_material(turns: Iterable[Mapping[str, Any]], *, budget_chars: int,
+                         row_limit: int = CONCLUSIONS_ROW_LIMIT) -> list[dict[str, Any]]:
     """Recent, budget-capped assistant prose for the conclusions leg.
 
     Newest turns are kept until the budget is spent, then the selection is restored to
     chronological order so the digest reads as a narrative instead of a reverse one.
+
+    The per-row cap has to be prose-sized. A 1,200-char excerpt limit applied to analysis
+    replies cut 77% of a real research session's conclusions before the model ever saw them
+    (46,872 chars of prose in the window -> 10,667 kept), which is what made the leg's output
+    reconstruction rather than digestion.
     """
-    rows = assistant_prose(turns)
+    rows = assistant_prose(turns, row_limit=row_limit)
     kept: list[dict[str, Any]] = []
     used = 0
     for row in reversed(rows):
