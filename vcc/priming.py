@@ -315,13 +315,50 @@ def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dic
                 PRIMES["skipped"] += 1
                 logger.info("vcc: prefix prime skipped (%s)", _note(stale))
                 return
-            busy = _engine_busy(opts)
-            if busy:
-                PRIMES["skipped"] += 1
-                logger.info("vcc: prefix prime skipped (%s)", _note(busy))
-                return
             session_model = getattr(agent, "model", "") or getattr(agent, "_model", "")
             wire, payload_route = wire_payload(agent, messages, system_prompt)
+            tools = getattr(agent, "tools", None) or None
+            head_sha, payload_chars, tool_count = _fingerprint(wire, tools)
+            # Free measurements go first, before any gate: a run that cannot warm the cache must
+            # still report what the payload was and what the cache did with it afterwards.
+            counters = _cache_counters(opts, model=str(session_model))
+            threading.Thread(
+                target=_delta_watch, name="vcc-cache-window", daemon=True,
+                args=(opts, counters, float(opts.get("warm_after_compaction_delta_wait_s", 90)),
+                      str(session_model))).start()
+            if opts.get("warm_after_compaction_dry_run", False):
+                # Measure, don't pay: the warm-up costs 12-21 s of prefill and landed on 1 of 7
+                # compactions on 2026-10-26, so nothing reaches the engine until the numbers say so.
+                PRIMES["skipped"] += 1
+                logger.info("vcc: prime dry-run (no warm request sent): %d wire messages / %d chars, "
+                            "head_sha=%s, tools=%d, payload from %s, session model %s; counters %s",
+                            len(wire), payload_chars, head_sha, tool_count, payload_route,
+                            session_model, counters)
+                _note(f"dry-run: {len(wire)} messages / {payload_chars} chars head_sha={head_sha}")
+                return
+            busy = _engine_busy(opts)
+            attempts = 1
+            max_attempts = max(1, int(opts.get("warm_after_compaction_idle_attempts", 1)))
+            while busy and attempts < max_attempts and not _looks_stale(agent, baseline):
+                # Waiting for the idle gap is the point, not a courtesy: measured 2026-10-26 at
+                # 15:22, three calls at 128-131k tokens went out on the *old* context after
+                # "compression done" and the first call carrying the 42-message handoff arrived
+                # 70 s later. Warming during the old turn both wastes the prefill and splashes.
+                sleep(float(opts.get("warm_after_compaction_retry_delay_s", 10.0)))
+                moved_on = _looks_stale(agent, baseline)
+                if moved_on:
+                    # A turn started during the wait: whatever we would warm is no longer the
+                    # prefix the next call will send, and the engine is busy again anyway.
+                    PRIMES["skipped"] += 1
+                    logger.info("vcc: prefix prime skipped (%s, while waiting for idle)", _note(moved_on))
+                    return
+                busy = _engine_busy(opts)
+                attempts += 1
+            if busy:
+                PRIMES["skipped"] += 1
+                logger.info("vcc: prefix prime skipped (%s, after %d idle probe(s))",
+                            _note(busy), attempts)
+                return
             client, model, route = _aux_route(str(session_model))
             aux_why = "" if client is not None else route  # route slot carries the refusal reason
             if client is None:
@@ -333,24 +370,6 @@ def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dic
                 why = aux_why or "no client reachable"
                 logger.info("vcc: prefix prime skipped (%s)", why)
                 _note(f"skipped: {why}")
-                return
-            tools = getattr(agent, "tools", None) or None
-            head_sha, payload_chars, tool_count = _fingerprint(wire, tools)
-            counters = _cache_counters(opts, model=str(model))
-            if opts.get("warm_after_compaction_dry_run", False):
-                # Measure, don't pay: the warm-up costs 12-21 s of prefill and landed 1 of 7
-                # compactions on 2026-10-26, so the payload fingerprint and the cache-counter
-                # window are collected without sending anything to the engine.
-                PRIMES["skipped"] += 1
-                logger.info("vcc: prime dry-run (no warm request sent): %d wire messages / %d chars, "
-                            "head_sha=%s, tools=%d, via %s on %s; counters %s",
-                            len(wire), payload_chars, head_sha, tool_count,
-                            f"{route}+{payload_route}", model, counters)
-                _note(f"dry-run: {len(wire)} messages / {payload_chars} chars head_sha={head_sha}")
-                threading.Thread(
-                    target=_delta_watch, name="vcc-cache-window", daemon=True,
-                    args=(opts, counters, float(opts.get("warm_after_compaction_delta_wait_s", 90)),
-                          str(model))).start()
                 return
             usage = send(opts, wire, model, client=client, tools=tools) or {}
             PRIMES["sent"] += 1

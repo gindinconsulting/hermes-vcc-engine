@@ -72,6 +72,8 @@ _DEFAULTS: dict[str, Any] = {
     "warm_after_compaction_probe_timeout_s": 0.5,
     "warm_after_compaction_dry_run": False,   # log what a prime WOULD send, without paying for it
     "warm_after_compaction_delta_wait_s": 90.0,  # re-read the cache counters this long after
+    "warm_after_compaction_idle_attempts": 1,  # probes before giving up on the idle gap
+    "warm_after_compaction_retry_delay_s": 10.0,  # spacing between those probes
     "projection_char_caps": {},
 }
 _CHARS_PER_TOKEN = 4  # same rough ratio Hermes's own estimator uses
@@ -194,6 +196,12 @@ def _engine_options(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "warm_after_compaction_delta_wait_s": _num(
             raw.get("warm_after_compaction_delta_wait_s", _DEFAULTS["warm_after_compaction_delta_wait_s"]),
             _DEFAULTS["warm_after_compaction_delta_wait_s"], 5.0, 900.0),
+        "warm_after_compaction_idle_attempts": int(_num(
+            raw.get("warm_after_compaction_idle_attempts", _DEFAULTS["warm_after_compaction_idle_attempts"]),
+            _DEFAULTS["warm_after_compaction_idle_attempts"], 1.0, 200.0)),
+        "warm_after_compaction_retry_delay_s": _num(
+            raw.get("warm_after_compaction_retry_delay_s", _DEFAULTS["warm_after_compaction_retry_delay_s"]),
+            _DEFAULTS["warm_after_compaction_retry_delay_s"], 1.0, 120.0),
     }
 
 

@@ -398,3 +398,58 @@ def test_fingerprint_localises_where_two_prompts_diverge():
     assert priming._fingerprint(tail_changed, [1, 2])[0] == base
     assert priming._fingerprint(head_changed, [1, 2])[0] != base
     assert priming._fingerprint(head, [1, 2, 3])[2] == 3
+
+
+def test_measurement_survives_a_busy_engine(monkeypatch, caplog):
+    """2026-10-26 15:22: the busy gate ran before the dry run, so a compaction that could not warm
+    also collected nothing. Counters and fingerprint cost the engine nothing, so they must be taken
+    whatever the gate decides."""
+    import logging
+
+    _fake_wire(monkeypatch)
+    monkeypatch.setattr(priming, "_engine_busy", lambda opts: "engine busy: 1 request(s) active")
+    msgs = _msgs(4)
+    with caplog.at_level(logging.INFO, logger="hermes_plugins.hermes_vcc_engine.priming"):
+        priming.prime(_Agent(msgs), msgs, "S",
+                      opts=_opts(warm_after_compaction_dry_run=True, warm_after_compaction_delta_wait_s=5.0),
+                      sender=lambda *a, **kw: pytest.fail("dry run must not send"), block=True)
+    line = next(r.getMessage() for r in caplog.records if "dry-run" in r.getMessage())
+    assert "counters" in line and "head_sha=" in line
+
+
+def test_the_prime_waits_for_the_idle_gap(monkeypatch):
+    """The compacted prefix is not sent until the next turn, so a busy engine means wait, not
+    give up — but each probe must be spaced by the configured delay, and the warm must be sent
+    exactly once, the moment the engine looks free."""
+    _fake_wire(monkeypatch)
+    probes = iter(["engine busy: 1 request(s) active", "engine busy: 1 request(s) active", ""])
+    monkeypatch.setattr(priming, "_engine_busy", lambda opts: next(probes))
+    sent: list = []
+    slept: list = []
+    priming.prime(_Agent(_msgs(4)), _msgs(4), "S",
+                  opts=_opts(warm_after_compaction_idle_attempts=5, warm_after_compaction_retry_delay_s=10.0),
+                  sender=lambda opts, wire, model, **kw: sent.append(model),
+                  sleep=lambda s: slept.append(s), block=True)
+    assert len(sent) == 1, "exactly one warm, once the engine went idle"
+    assert slept == [10.0, 10.0], f"probes spaced by the configured delay, got {slept}"
+
+
+def test_a_turn_starting_during_the_wait_abandons_the_warm(monkeypatch):
+    """A prefix that is no longer the next call's prefix is not worth warming: 2026-10-26's
+    09:50:39 splash was exactly that race."""
+    import agent.auxiliary_client as aux
+
+    _fake_wire(monkeypatch)
+    monkeypatch.setattr(priming, "_engine_busy", lambda opts: "engine busy: 1 request(s) active")
+    msgs = _msgs(4)
+    agent = _Agent(msgs)
+
+    def _moving_sleep(_seconds: float) -> None:
+        # _Agent copies the list it is handed; priming watches the agent's live history.
+        agent.messages.append({"role": "user", "content": "a turn started"})
+
+    priming.prime(agent, msgs, "S",
+                  opts=_opts(warm_after_compaction_idle_attempts=5, warm_after_compaction_retry_delay_s=10.0),
+                  sender=lambda *a, **kw: pytest.fail("a stale prefix must not be warmed"),
+                  sleep=_moving_sleep, block=True)
+    assert priming.PRIMES["sent"] == 0 and "history changed" in priming.PRIMES["last"]
