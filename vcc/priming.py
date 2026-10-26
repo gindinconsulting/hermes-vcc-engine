@@ -17,6 +17,7 @@ request would make it slower, not faster.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -79,6 +80,67 @@ def _admin_key(explicit: Any) -> str:
             return str((json.load(fh).get("auth") or {}).get("api_key") or "").strip()
     except Exception:  # noqa: BLE001 - a missing key just means an unauthenticated probe
         return ""
+
+
+def _cache_counters(opts: dict[str, Any], opener: Callable[..., Any] = urllib.request.urlopen,
+                    model: str = "") -> Optional[dict[str, Any]]:
+    """Cumulative prefix-cache counters, read from the same admin endpoint as the idle probe.
+
+    `server.log` never reports reuse — I grepped a full day of it — but `/admin/api/stats` does:
+    `total_cached_tokens` server-wide, plus per-model `cache_rates.cumulative.{prefix_hits,
+    prefix_misses,evictions}`. Sampling this before and after the operator's first post-compaction
+    call turns "I think it missed" into a number. Returns ``None`` when unreachable, never raises.
+    """
+    url = str(opts.get("warm_after_compaction_idle_probe") or "").strip()
+    if not url:
+        return None
+    key = _admin_key(opts.get("warm_after_compaction_idle_probe_key"))
+    request = urllib.request.Request(url, headers={"Authorization": f"Bearer {key}"})
+    try:
+        with opener(request, timeout=float(opts.get("warm_after_compaction_probe_timeout_s", 0.5))) as resp:
+            payload = json.load(resp)
+    except Exception:  # an unreachable engine just means no counters this time
+        return None
+    engines = (payload.get("runtime_cache") or {}).get("models") or []
+    chosen = next((m for m in engines
+                   if _base_model(m.get("id") or "") == _base_model(model)), engines[0] if engines else {})
+    rates = (chosen.get("cache_rates") or {}).get("cumulative") or {}
+    return {
+        "cached": payload.get("total_cached_tokens"),
+        "prompt": payload.get("total_prompt_tokens"),
+        "hits": rates.get("prefix_hits"),
+        "misses": rates.get("prefix_misses"),
+        "evictions": rates.get("evictions"),
+    }
+
+
+def _delta_watch(opts: dict[str, Any], before: Optional[dict[str, Any]], wait_s: float,
+                 model: str = "", sleep: Callable[[float], None] = time.sleep) -> None:
+    """Log what the cache actually served between the prime window and the operator's next turn."""
+    sleep(wait_s)
+    after = _cache_counters(opts, model=model)
+    if not before or not after or before.get("cached") is None or after.get("cached") is None:
+        logger.info("vcc: cache window unusable (counters unavailable before or after)")
+        return
+    delta = {k: (after[k] - before[k]) if isinstance(after.get(k), int) and isinstance(before.get(k), int)
+             else "?" for k in ("cached", "prompt", "hits", "misses", "evictions")}
+    logger.info("vcc: cache window %+.0fs after compaction: cached %+s tokens served, prompt %+s, "
+                "prefix hits %+s, misses %+s, evictions %+s",
+                wait_s, delta["cached"], delta["prompt"], delta["hits"], delta["misses"],
+                delta["evictions"])
+    _note("window " + " ".join(f"{k}={v}" for k, v in delta.items()))
+
+
+def _fingerprint(wire: list, tools: Any) -> tuple[str, int, int]:
+    """A hash of the payload HEAD plus its size — enough to say where two prompts diverge.
+
+    A prime only helps if it is byte-identical to the request that follows, and "identical
+    length" is not identical: on 2026-10-26 a 38,011-token prime preceded a 38,022-token turn
+    that still paid a 10.51 s cold prefill. The head hash separates `the system/tools region
+    moved` (head differs) from `only the tail grew` (head matches, total differs).
+    """
+    text = "".join(str(m.get("content") or "") for m in wire)
+    return hashlib.sha256(text[:1024].encode("utf-8", "replace")).hexdigest()[:12], len(text), len(tools or [])
 
 
 def _queued_requests(payload: Any) -> int:
@@ -171,7 +233,7 @@ def _aux_route(session_model: str) -> tuple[Any, str, str]:
 
 
 def send_prime(opts: dict[str, Any], wire: list, model: str, client: Any = None,
-               tools: Optional[list] = None) -> None:
+               tools: Optional[list] = None) -> dict[str, Any]:
     """One non-streaming, single-token completion over `wire` — a prefill, not an answer.
 
     `client` is the instance that will serve the next turn; with none given this falls back to
@@ -203,11 +265,35 @@ def send_prime(opts: dict[str, Any], wire: list, model: str, client: Any = None,
             kwargs["extra_body"] = extra
     except Exception:  # noqa: BLE001 - extra_body is provider decoration, never the point
         pass
-    client.chat.completions.create(**kwargs)
+    response = client.chat.completions.create(**kwargs)
+    return _usage_of(response)
+
+
+def _usage_of(response: Any) -> dict[str, Any]:
+    """``{prompt, cached}`` from a completion's usage block, tolerant of provider shape drift.
+
+    oMLX answers a non-streaming call with `usage.prompt_tokens_details.cached_tokens` — measured
+    on 2026-10-26: a cold 46,060-token prime reported `cached_tokens: 0`. That field, not timing,
+    is the authoritative reuse count.
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None and isinstance(response, dict):
+        usage = response.get("usage")
+    if usage is None:
+        return {}
+
+    def _get(obj: Any, key: str) -> Any:
+        return obj.get(key) if isinstance(obj, dict) else getattr(obj, key, None)
+
+    details = _get(usage, "prompt_tokens_details") or {}
+    cached = _get(details, "cached_tokens")
+    if cached is None:
+        cached = _get(usage, "cache_read_input_tokens")
+    return {"prompt": _get(usage, "prompt_tokens"), "cached": cached}
 
 
 def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dict[str, Any],
-          sender: Optional[Callable[..., None]] = None,
+          sender: Optional[Callable[..., dict[str, Any]]] = None,
           sleep: Callable[[float], None] = time.sleep, block: bool = False) -> str:
     """Warm the next turn's prefix on a daemon thread. Returns the decision, never raises.
 
@@ -215,6 +301,7 @@ def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dic
     caller that wants the decision rather than the fire-and-forget.
     """
     sender = sender or send_prime
+    send: Callable[..., dict[str, Any]] = sender
     baseline = len(messages)
     started = time.perf_counter()
 
@@ -247,15 +334,37 @@ def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dic
                 logger.info("vcc: prefix prime skipped (%s)", why)
                 _note(f"skipped: {why}")
                 return
-            sender(opts, wire, model, client=client,
-                   tools=(getattr(agent, "tools", None) or None))
+            tools = getattr(agent, "tools", None) or None
+            head_sha, payload_chars, tool_count = _fingerprint(wire, tools)
+            counters = _cache_counters(opts, model=str(model))
+            if opts.get("warm_after_compaction_dry_run", False):
+                # Measure, don't pay: the warm-up costs 12-21 s of prefill and landed 1 of 7
+                # compactions on 2026-10-26, so the payload fingerprint and the cache-counter
+                # window are collected without sending anything to the engine.
+                PRIMES["skipped"] += 1
+                logger.info("vcc: prime dry-run (no warm request sent): %d wire messages / %d chars, "
+                            "head_sha=%s, tools=%d, via %s on %s; counters %s",
+                            len(wire), payload_chars, head_sha, tool_count,
+                            f"{route}+{payload_route}", model, counters)
+                _note(f"dry-run: {len(wire)} messages / {payload_chars} chars head_sha={head_sha}")
+                threading.Thread(
+                    target=_delta_watch, name="vcc-cache-window", daemon=True,
+                    args=(opts, counters, float(opts.get("warm_after_compaction_delta_wait_s", 90)),
+                          str(model))).start()
+                return
+            usage = send(opts, wire, model, client=client, tools=tools) or {}
             PRIMES["sent"] += 1
-            payload_chars = sum(len(str(m.get("content") or "")) for m in wire)
             elapsed = (time.perf_counter() - started) * 1000
-            logger.info("vcc: prefix primed: %d wire messages / %d chars via %s on %s in %.0f ms "
-                        "(the next call prefills only its delta)",
-                        len(wire), payload_chars, f"{route}+{payload_route}", model, elapsed)
+            logger.info("vcc: prefix primed: %d wire messages / %d chars (head_sha=%s, tools=%d) via "
+                        "%s on %s in %.0f ms; warm request itself: prompt=%s cached=%s tokens",
+                        len(wire), payload_chars, head_sha, tool_count,
+                        f"{route}+{payload_route}", model, elapsed,
+                        usage.get("prompt"), usage.get("cached"))
             _note(f"primed {len(wire)} messages / {payload_chars} chars via {route}+{payload_route}")
+            threading.Thread(target=_delta_watch, name="vcc-cache-window", daemon=True,
+                             args=(opts, counters,
+                                   float(opts.get("warm_after_compaction_delta_wait_s", 90)),
+                                   str(model))).start()
             # A prefill only helps if the operator's next message arrives after it. Re-checking
             # afterwards catches the case that cost latency on this box at 09:09:57: the prime was
             # still prefilling 41k tokens when the turn landed, so the turn queued behind it
@@ -317,8 +426,9 @@ def install(opts: dict[str, Any]) -> None:
     cc.compress_context = wrapper
     _INSTALLED.update({"wrapper": wrapper, "original": original})
     PRIMES["installs"] += 1
-    logger.info("vcc: post-compaction prefix priming installed (delay %ss, max_tokens %s)",
-                opts["warm_after_compaction_delay_s"], opts["warm_after_compaction_max_tokens"])
+    logger.info("vcc: post-compaction prefix priming installed (delay %ss, max_tokens %s, dry_run %s)",
+                opts["warm_after_compaction_delay_s"], opts["warm_after_compaction_max_tokens"],
+                opts.get("warm_after_compaction_dry_run", False))
 
 
 def uninstall() -> None:

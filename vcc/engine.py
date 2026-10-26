@@ -70,6 +70,8 @@ _DEFAULTS: dict[str, Any] = {
     "warm_after_compaction_idle_probe": "",  # engine admin URL to ask whether a turn is already queued
     "warm_after_compaction_idle_probe_key": "",  # bearer for it; "" = env OMLX_ADMIN_KEY or ~/.omlx/settings.json
     "warm_after_compaction_probe_timeout_s": 0.5,
+    "warm_after_compaction_dry_run": False,   # log what a prime WOULD send, without paying for it
+    "warm_after_compaction_delta_wait_s": 90.0,  # re-read the cache counters this long after
     "projection_char_caps": {},
 }
 _CHARS_PER_TOKEN = 4  # same rough ratio Hermes's own estimator uses
@@ -187,6 +189,11 @@ def _engine_options(cfg: Mapping[str, Any]) -> dict[str, Any]:
         "warm_after_compaction_probe_timeout_s": _num(
             raw.get("warm_after_compaction_probe_timeout_s", _DEFAULTS["warm_after_compaction_probe_timeout_s"]),
             _DEFAULTS["warm_after_compaction_probe_timeout_s"], 0.05, 10.0),
+        "warm_after_compaction_dry_run": bool(raw.get("warm_after_compaction_dry_run",
+                                                      _DEFAULTS["warm_after_compaction_dry_run"])),
+        "warm_after_compaction_delta_wait_s": _num(
+            raw.get("warm_after_compaction_delta_wait_s", _DEFAULTS["warm_after_compaction_delta_wait_s"]),
+            _DEFAULTS["warm_after_compaction_delta_wait_s"], 5.0, 900.0),
     }
 
 

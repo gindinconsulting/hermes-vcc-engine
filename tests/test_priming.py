@@ -327,3 +327,74 @@ def test_prime_fires_when_the_probe_reports_the_engine_idle(monkeypatch):
     assert len(sent) == 1, sent
     assert priming.PRIMES["skipped"] == 0
 
+
+
+def _fake_wire(monkeypatch):
+    import agent.auxiliary_client as aux
+
+    monkeypatch.setattr(priming, "agent_build_api_messages",
+                        lambda agent, messages, **kw: ([{"role": "system", "content": "S"}] + list(messages), "S"))
+    monkeypatch.setattr(aux, "get_text_auxiliary_client", lambda task="": (object(), "Qwen-Flash"))
+
+
+def test_dry_run_measures_without_paying_for_the_prefill(monkeypatch, caplog):
+    """2026-10-26: the warm-up landed on 1 of 7 compactions and cost 12-21 s of prefill each time,
+    so the config may collect the payload fingerprint and the cache-counter window while sending
+    nothing. A dry run that still calls the sender would be paying for the thing it measures."""
+    import logging
+
+    _fake_wire(monkeypatch)
+    sent: list = []
+    msgs = _msgs(4)
+    with caplog.at_level(logging.INFO, logger="hermes_plugins.hermes_vcc_engine.priming"):
+        priming.prime(_Agent(msgs), msgs, "S",
+                      opts=_opts(warm_after_compaction_dry_run=True, warm_after_compaction_delta_wait_s=5.0),
+                      sender=lambda *a, **kw: sent.append(a), block=True)
+    assert sent == [], "a dry run must not put a prefill on the engine"
+    assert priming.PRIMES["sent"] == 0 and priming.PRIMES["skipped"] == 1
+    assert priming.PRIMES["last"].startswith("dry-run")
+    lines = [r.getMessage() for r in caplog.records if "dry-run" in r.getMessage()]
+    assert lines and "head_sha=" in lines[0], "the payload fingerprint is the diagnostic being collected"
+
+
+def test_the_live_prime_logs_the_reuse_count_it_earned(monkeypatch, caplog):
+    """`cached_tokens` from the warm response, not a timing inference, is what settles whether a
+    prime was reusable at all — so the log line has to carry it."""
+    import logging
+
+    _fake_wire(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="hermes_plugins.hermes_vcc_engine.priming"):
+        priming.prime(_Agent(_msgs(4)), _msgs(4), "S", opts=_opts(),
+                      sender=lambda opts, wire, model, **kw: {"prompt": 40228, "cached": 0}, block=True)
+    line = next(r.getMessage() for r in caplog.records if "prefix primed" in r.getMessage())
+    assert "prompt=40228 cached=0 tokens" in line and "head_sha=" in line
+
+
+def test_usage_survives_provider_shape_drift():
+    """OpenAI-style dicts, attribute objects, and no usage block at all: none may raise."""
+    class _Details:
+        cached_tokens = 7777
+
+    class _Usage:
+        prompt_tokens = 40228
+        prompt_tokens_details = _Details()
+
+    class _Resp:
+        usage = _Usage()
+
+    assert priming._usage_of(_Resp()) == {"prompt": 40228, "cached": 7777}
+    assert priming._usage_of({"usage": {"prompt_tokens": 5, "prompt_tokens_details": {"cached_tokens": 3}}}) \
+        == {"prompt": 5, "cached": 3}
+    assert priming._usage_of({"usage": {"prompt_tokens": 5, "cache_read_input_tokens": 2}}) == {"prompt": 5, "cached": 2}
+    assert priming._usage_of(object()) == {}
+
+
+def test_fingerprint_localises_where_two_prompts_diverge():
+    """Same length, different head: the hash changes. Same head, different tail: it does not."""
+    head = [{"role": "system", "content": "S" * 2000}, {"role": "user", "content": "old"}]
+    tail_changed = [{"role": "system", "content": "S" * 2000}, {"role": "user", "content": "newer"}]
+    head_changed = [{"role": "system", "content": "T" * 2000}, {"role": "user", "content": "old"}]
+    base = priming._fingerprint(head, [1, 2])[0]
+    assert priming._fingerprint(tail_changed, [1, 2])[0] == base
+    assert priming._fingerprint(head_changed, [1, 2])[0] != base
+    assert priming._fingerprint(head, [1, 2, 3])[2] == 3
