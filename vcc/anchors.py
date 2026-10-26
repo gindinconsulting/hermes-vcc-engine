@@ -77,7 +77,7 @@ def _literal_lines(text: str, literals: tuple[str, ...], cap: int) -> Optional[l
 
 def _regex_lines(text: str, finder: Any, cap: int) -> Optional[list[str]]:
     lines: list[str] = []
-    find, rfind, search, size = text.find, text.rfind, finder.search, len(text)
+    find, rfind, search = text.find, text.rfind, finder.search
     m = search(text)
     while m:
         cap -= 1
@@ -102,7 +102,7 @@ def _hexrun_lines(text: str, run: int, cap: int) -> Optional[list[str]]:
     mask = data.translate(_HEX_MASK)
     needle = b"h" * run
     lines: list[str] = []
-    find, rfind, size = data.find, data.rfind, len(data)
+    find, rfind = data.find, data.rfind
     i = mask.find(needle)
     while i != -1:
         cap -= 1

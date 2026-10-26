@@ -90,12 +90,12 @@ def limits_from_opts(opts: Mapping[str, Any]) -> Limits:
     if not isinstance(caps, Mapping):
         return Limits()
     over: dict[str, int] = {}
-    for name, field in _CAP_FIELDS.items():
+    for name, key in _CAP_FIELDS.items():
         raw = caps.get(name)
         if raw is None:
             continue
         try:
-            over[field] = max(40, min(int(raw), 20_000))
+            over[key] = max(40, min(int(raw), 20_000))
         except (TypeError, ValueError):
             continue  # unparsable: keep this cap's default rather than fail the compaction
     return Limits(**over) if over else Limits()
@@ -843,7 +843,7 @@ def _fit(proj: _Projection, session_id: str, limits: Limits, budget: int) -> str
 
     # 3. Drop kept lines oldest-first, but always keep the newest user line.
     overflow = len(text) - budget
-    newest_user = max((i for i, l in enumerate(shortened) if l.kind == "user"), default=-1)
+    newest_user = max((i for i, line in enumerate(shortened) if line.kind == "user"), default=-1)
     final: list[_Line] = []
     removed = 0
     for i, line in enumerate(shortened):
