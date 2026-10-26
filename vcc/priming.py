@@ -416,10 +416,10 @@ def prime(agent: Any, messages: list, system_prompt: Optional[str], *, opts: dic
                         f"{route}+{payload_route}", model, elapsed,
                         usage.get("prompt"), usage.get("cached"))
             _note(f"primed {len(wire)} messages / {payload_chars} chars via {route}+{payload_route}")
-            threading.Thread(target=_delta_watch, name="vcc-cache-window", daemon=True,
-                             args=(opts, counters,
-                                   float(opts.get("warm_after_compaction_delta_wait_s", 90)),
-                                   str(model))).start()
+            # One cache-window reporter per prime, opened above before the gates: it is anchored on the
+            # pre-warm baseline and the session model, so it already covers this warm request and every
+            # turn in the window. A second reporter used to be started here (until 2026-10-26 16:38),
+            # which is why the `cache window +180s` line logged twice with identical counters.
             # A prefill only helps if the operator's next message arrives after it. Re-checking
             # afterwards catches the case that cost latency on this box at 09:09:57: the prime was
             # still prefilling 41k tokens when the turn landed, so the turn queued behind it

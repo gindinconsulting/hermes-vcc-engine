@@ -490,3 +490,42 @@ def test_a_broken_builder_still_degrades_to_raw_history(monkeypatch):
     wire, route = priming.wire_payload(agent, agent.messages, "S")
     assert route.startswith("fallback raw history (RuntimeError") and wire[0]["role"] == "system"
     assert not hasattr(agent, "_current_turn_timestamp")
+
+
+def test_one_prime_opens_exactly_one_cache_window_reporter(monkeypatch):
+    """_delta_watch used to be started twice on the live path - once before the dry-run gate (free
+    measurements go first) and once after the warm - so every prime logged its `cache window +180s`
+    line twice with identical counters (16:38:00 and 16:38:11). One prime, one window, anchored on
+    the pre-warm baseline and the session model, so it already covers the warm and every turn in it."""
+    import agent.auxiliary_client as aux
+    import threading as real_threading
+
+    started: list = []
+
+    class _Thread:
+        def __init__(self, target=None, name="", daemon=None, args=(), **kw):
+            self.args, self.name = args, name
+
+        def start(self):
+            if self.name == "vcc-cache-window":
+                started.append(self.args)
+
+    class _ThreadNs:
+        Thread = _Thread
+
+        def __getattr__(self, item):
+            return getattr(real_threading, item)
+
+    monkeypatch.setattr(aux, "get_text_auxiliary_client", lambda task="": (object(), "Qwen-Flash"))
+    monkeypatch.setattr(priming, "_engine_busy", lambda opts: "")
+    monkeypatch.setattr(priming, "threading", _ThreadNs())
+
+    msgs = _msgs(3)
+    agent = _Agent(msgs)
+    priming.prime(agent, msgs, "S", opts=_opts(), sender=lambda *a, **k: {"prompt": 10}, block=True)
+    assert len(started) == 1, f"live prime must open one window, got {len(started)}"
+
+    started.clear()
+    opts = dict(_opts(), warm_after_compaction_dry_run=True)
+    priming.prime(agent, msgs, "S", opts=opts, sender=lambda *a, **k: {"prompt": 10}, block=True)
+    assert len(started) == 1, f"a dry-run prime measures too, exactly one window, got {len(started)}"
