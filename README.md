@@ -185,6 +185,17 @@ Everything is optional, set under `context.vcc` in `config.yaml`. Out-of-range v
 | `fallback_to_llm` | `true` | bool | If the summary raises an error, use Hermes's stock LLM summary for that pass |
 | `fast_anchors` | `true` | bool | Build Hermes's anchor index with `vcc/anchors.py`, which is checked against Hermes's own builder and switches itself off on any mismatch |
 
+### Hybrid additions (this fork)
+
+| Key | Default | Range | Effect |
+|---|---|---|---|
+| `record_trigger` | `true` | bool | Adds a `## Compaction Trigger` section naming what asked for the compaction — a manual `/compress` (with its focus topic) or the automatic threshold — which the transcript itself cannot show |
+| `preserve_conclusions` | `false` | bool | Runs ONE bounded summary-model call over the agent's own prose and appends it as `## What the Agent Concluded`; the deterministic projection keeps what happened, only a model can keep what the agent concluded |
+| `conclusions_input_tokens` | `9000` | 500–60,000 | Cap on the assistant prose handed to that call; tool-result bodies are never included, so the input is a fraction of a full-context summary's |
+| `conclusions_output_tokens` | `900` | 100–4,000 | Cap on the digest it may write back |
+
+With `preserve_conclusions` off — the default, and upstream's behavior — the engine still makes **no LLM call at all**. Turned on, the leg is strictly additive: if it errors, stalls, or returns nothing, the handoff ships without that section and the deterministic core is unaffected. Both new sections are treated as the engine's own, so a later compaction drops them from the previous summary instead of folding a stale trigger or digest forward.
+
 The budget is the smallest of `budget_ratio` × window, Hermes's own content-scaled summary budget, and `max_budget_tokens`, but never less than `min_budget_tokens`. Hermes doesn't pass its `compression:` settings to plugin engines, so the engine reads the same keys the built-in compressor reads, with the same defaults (`threshold`, `protect_last_n`, `target_ratio` and the rest; see `vcc/engine.py:_compressor_kwargs`).
 
 ## Security and privacy

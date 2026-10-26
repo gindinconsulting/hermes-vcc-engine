@@ -50,6 +50,10 @@ _DEFAULTS: dict[str, Any] = {
     "max_budget_tokens": 8000,
     "fallback_to_llm": True,     # on an unexpected projection error, use the stock summary
     "fast_anchors": True,        # build Hermes's anchor index with anchors.py (same output, faster)
+    "record_trigger": True,      # say in the handoff what asked for it (manual /compress vs automatic)
+    "preserve_conclusions": False,  # hybrid leg: ONE bounded LLM call that keeps the agent's conclusions
+    "conclusions_input_tokens": 9000,   # cap on the assistant prose handed to that call
+    "conclusions_output_tokens": 900,   # cap on the digest it may write back
 }
 _CHARS_PER_TOKEN = 4  # same rough ratio Hermes's own estimator uses
 
@@ -133,6 +137,12 @@ def _engine_options(cfg: Mapping[str, Any]) -> dict[str, Any]:
                                       _DEFAULTS["max_budget_tokens"], 500, 100_000)),
         "fallback_to_llm": bool(raw.get("fallback_to_llm", _DEFAULTS["fallback_to_llm"])),
         "fast_anchors": bool(raw.get("fast_anchors", _DEFAULTS["fast_anchors"])),
+        "record_trigger": bool(raw.get("record_trigger", _DEFAULTS["record_trigger"])),
+        "preserve_conclusions": bool(raw.get("preserve_conclusions", _DEFAULTS["preserve_conclusions"])),
+        "conclusions_input_tokens": int(_num(raw.get("conclusions_input_tokens", _DEFAULTS["conclusions_input_tokens"]),
+                                             _DEFAULTS["conclusions_input_tokens"], 500, 60_000)),
+        "conclusions_output_tokens": int(_num(raw.get("conclusions_output_tokens", _DEFAULTS["conclusions_output_tokens"]),
+                                              _DEFAULTS["conclusions_output_tokens"], 100, 4000)),
     }
 
 
@@ -162,6 +172,8 @@ class VccEngine(ContextCompressor):
         self._vcc_last_ms: Optional[float] = None
         self._vcc_runs = 0
         self._vcc_fallbacks = 0
+        # What asked for the compaction now in flight (set by compress(), read by _generate_summary).
+        self._vcc_trigger: Optional[dict[str, Any]] = None
         missing = _missing_seams()
         self._vcc_passthrough = bool(missing)
         if missing:
@@ -229,6 +241,101 @@ class VccEngine(ContextCompressor):
             _disable_fast_anchors(f"{type(exc).__name__}: {exc}")
             return None
 
+    # ------------------------------------------------------------------ hybrid additions
+
+    def compress(
+        self, messages: list[dict[str, Any]], current_tokens: Optional[int] = None, focus_topic: Optional[str] = None,
+        force: bool = False, memory_context: str = "", bypass_cooldown: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Note what asked for this compaction, then defer to Hermes.
+
+        Manual ``/compress`` reaches an engine as ``force=True`` (``compress_now`` →
+        ``agent._compress_context``); an automatic pass reaches it as ``force=False``.
+        ``focus_topic`` cannot tell them apart — core fills it with an auto-derived topic when
+        the user gave none. The signature mirrors ``ContextCompressor.compress`` exactly,
+        because core filters engine keywords by signature.
+        """
+        self._vcc_trigger = {
+            "manual": bool(force),
+            "focus": (focus_topic or "").strip() or None,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            return super().compress(
+                messages, current_tokens=current_tokens, focus_topic=focus_topic, force=force,
+                memory_context=memory_context, bypass_cooldown=bypass_cooldown)
+        finally:
+            self._vcc_trigger = None
+
+    def _vcc_trigger_section(self, used_llm: bool) -> str:
+        """Two lines naming the trigger — something the transcript itself cannot show.
+
+        Deliberately no elapsed-time figure here: a handoff must be byte-reproducible for a
+        given compaction (Hermes's own tests compare projections for equality), and the
+        duration is already in the log line and in ``get_status()['vcc_last_ms']``.
+        """
+        trigger = self._vcc_trigger or {}
+        when = trigger.get("at") or "unknown time"
+        if trigger.get("manual"):
+            focus = f', focused on "{trigger["focus"]}"' if trigger.get("focus") else ""
+            first = (f"The user ran `/compress` at {when}{focus}. That command is not part of the "
+                     "transcript above: this handoff replaced the turns it folded away.")
+        else:
+            first = f"Automatic: the context crossed the compaction threshold at {when}."
+        how = " with one bounded summary-model call" if used_llm else " with no LLM call"
+        return f"{projector.TRIGGER_HEADING}\n{first}\nBuilt by the {ENGINE_NAME} engine{how}."
+
+    def _vcc_conclusions(
+        self, turns_to_summarize: list[dict[str, Any]], focus_topic: Optional[str],
+        memory_context: str, bypass_cooldown: bool,
+    ) -> Optional[str]:
+        """The hybrid leg: ONE bounded model call over the agent's own prose.
+
+        The projection keeps what *happened*; only a model can keep what the agent *concluded*.
+        Tool-result bodies are excluded outright and the input is capped, so this reads a
+        fraction of what a full-context summary reads. Any failure, or an empty answer, simply
+        means the handoff ships without the section: the deterministic core never depends on it.
+        """
+        opts = self._vcc_options
+        if not opts["preserve_conclusions"] or self._vcc_passthrough:
+            return None
+        material = projector.conclusions_material(
+            turns_to_summarize, budget_chars=opts["conclusions_input_tokens"] * _CHARS_PER_TOKEN)
+        if not material:
+            return None
+        # Hermes records a summary-model failure here; the structural fallback it inserts in the
+        # model's place is recorded the same way (see _generate_summary's stall path).
+        self._last_summary_error = None
+        started = time.perf_counter()
+        try:
+            digest = super()._generate_summary(material, focus_topic, memory_context, bypass_cooldown)
+        except Exception as exc:
+            logger.warning("vcc: conclusions leg failed (%s: %s); shipping the deterministic handoff",
+                           type(exc).__name__, exc)
+            return None
+        if not digest or getattr(self, "_summary_model_fallen_back", False):
+            return None
+        # A refused or stalled summariser (an oMLX 507 memory ceiling, a timeout) makes Hermes
+        # insert a STRUCTURAL fallback summary. That restates the transcript we already projected
+        # deterministically, so shipping it as a "conclusion" buys nothing and charges the whole
+        # leg's latency for it. Refuse it, and let the trigger line say "no LLM call" honestly.
+        failure = str(getattr(self, "_last_summary_error", "") or "")
+        if "deterministic fallback summary inserted" in failure or "summary model" in failure.lower():
+            logger.info("vcc: conclusions leg produced no model output (%s); skipping the section",
+                        failure[:160])
+            return None
+        import agent.context_compressor as cc
+        # The stock summariser returns a WHOLE handoff, handoff banner included; ours is one
+        # section of a handoff, so the banner has to go or the result pays ~700 chars to say
+        # the same thing twice.
+        body = projector.clean(cc.ContextCompressor._strip_summary_prefix(str(digest).strip()),
+                               opts["conclusions_output_tokens"] * _CHARS_PER_TOKEN)
+        if not body.strip():
+            return None
+        logger.info("vcc: conclusions digest: %d prose turns -> %d chars in %.0f ms",
+                    len(material), len(body), (time.perf_counter() - started) * 1000)
+        return f"{projector.CONCLUSIONS_HEADING}\n{body}"
+
     # ------------------------------------------------------------------ summary override
 
     def _vcc_budget_chars(self, turns: list[dict[str, Any]]) -> int:
@@ -294,6 +401,9 @@ class VccEngine(ContextCompressor):
                 summary += cc._redact_compaction_text(anchor_section)
             summary = self._augment_summary_lean(summary, turns_to_summarize)
             self._validate_summary_user_provenance(summary, has_user_turn)
+            conclusions = self._vcc_conclusions(turns_to_summarize, focus_topic, memory_context, bypass_cooldown)
+            if conclusions:
+                summary += "\n\n" + conclusions
         except AuxiliaryExplicitCancellation:
             raise
         except Exception as exc:
@@ -316,8 +426,11 @@ class VccEngine(ContextCompressor):
 
         self._vcc_runs += 1
         self._vcc_last_ms = round((time.perf_counter() - started) * 1000, 2)
-        logger.info("vcc: projected %d turns into %d chars in %.1f ms (no LLM call)",
-                    len(turns_to_summarize), len(summary), self._vcc_last_ms)
+        logger.info("vcc: projected %d turns into %d chars in %.1f ms%s",
+                    len(turns_to_summarize), len(summary), self._vcc_last_ms,
+                    " (+ bounded conclusions leg)" if conclusions else " (no LLM call)")
+        if self._vcc_options["record_trigger"]:
+            summary += "\n\n" + self._vcc_trigger_section(bool(conclusions))
         return self._with_summary_prefix(summary)
 
 

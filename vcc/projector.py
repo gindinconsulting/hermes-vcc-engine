@@ -27,6 +27,11 @@ COMMANDS_HEADING = "## Commands Run"
 LOG_HEADING = "## Detailed Session Log (oldest first)"
 EARLIER_HEADING = "## Earlier Summary"
 ERROR_NAMES_HEADING = "## Error Names Seen"
+# Hybrid additions (fork): what triggered this compaction, and the bounded LLM digest of the
+# agent's own conclusions. Both are OURS, so re-compaction must strip them from the previous
+# summary instead of folding a stale trigger or a stale digest forward.
+TRIGGER_HEADING = "## Compaction Trigger"
+CONCLUSIONS_HEADING = "## What the Agent Concluded"
 
 NO_USER_TASK = "None. This session contains no user-authored turns."
 
@@ -42,7 +47,7 @@ _HERMES_LEAN_HEADINGS = (
 )
 _OUR_HEADINGS = (
     TASK_HEADING, GOAL_HEADING, BLOCKED_HEADING, FIXES_HEADING, ERROR_NAMES_HEADING, FILES_HEADING,
-    COMMANDS_HEADING, LOG_HEADING, EARLIER_HEADING,
+    COMMANDS_HEADING, LOG_HEADING, EARLIER_HEADING, TRIGGER_HEADING, CONCLUSIONS_HEADING,
 )
 
 
@@ -821,3 +826,40 @@ def iter_refs(summary: str) -> Iterable[int]:
     """Message ids referenced by ``[#N]`` in a projection (handy for tests and tooling)."""
     for match in re.finditer(r"\[#(\d+)\]", summary or ""):
         yield int(match.group(1))
+
+
+def assistant_prose(turns: Iterable[Mapping[str, Any]], *, row_limit: int = 1200) -> list[dict[str, Any]]:
+    """Assistant turns worth a conclusions digest — judgement, not tool-call chatter.
+
+    A conclusion lives in the text the agent wrote *around* its tool calls, so tool-result
+    bodies are excluded outright: that exclusion is what makes the hybrid leg's input a
+    fraction of a full summary's. Turns shorter than a sentence carry nothing to preserve.
+    """
+    out: list[dict[str, Any]] = []
+    for turn in turns or ():
+        if turn.get("role") != "assistant":
+            continue
+        text = strip_think(content_text(turn.get("content")))
+        if len(text) < 80:
+            continue
+        out.append({"role": "assistant", "content": clean(text, row_limit)})
+    return out
+
+
+def conclusions_material(turns: Iterable[Mapping[str, Any]], *, budget_chars: int) -> list[dict[str, Any]]:
+    """Recent, budget-capped assistant prose for the conclusions leg.
+
+    Newest turns are kept until the budget is spent, then the selection is restored to
+    chronological order so the digest reads as a narrative instead of a reverse one.
+    """
+    rows = assistant_prose(turns)
+    kept: list[dict[str, Any]] = []
+    used = 0
+    for row in reversed(rows):
+        cost = len(row["content"]) + 1
+        if used + cost > max(0, int(budget_chars)):
+            continue
+        kept.append(row)
+        used += cost
+    kept.reverse()
+    return kept

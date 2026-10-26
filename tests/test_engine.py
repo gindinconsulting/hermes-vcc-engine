@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from typing import Any
 
 import pytest
 
@@ -330,3 +331,149 @@ def test_legacy_tail_mode_never_adds_an_anchor_section(cc):
     eng = make_engine(config={"compression": {"tail_mode": "legacy"}})
     out = eng._generate_summary(session(fix_the_build(), long_session(30, output_chars=800)))
     assert cc._LEAN_ANCHOR_HEADING not in out
+
+
+# ------------------------------------------------------------- hybrid: trigger recording + conclusions
+
+
+def _prose_session(rounds: int = 12) -> list[dict[str, Any]]:
+    """A session with real assistant judgement, which the shared fixtures do not carry.
+
+    Conclusions only exist in the text the agent writes around its tool calls, so the hybrid
+    tests need turns that contain it; ``long_session`` is deliberately all tool output.
+    """
+    msgs = [{"role": "system", "content": "You are Hermes."}, user("did the tests pass, and what now?")]
+    for i in range(rounds):
+        msgs.append(assistant(
+            f"Verdict {i}: the failures are the suite's real-home I/O guard, not a regression in "
+            f"the patch, so the plan stands — keep it and move to the next gate."))
+        msgs += terminal_turn(f"p{i}", f"pytest tests/gate_{i}.py", "46 failed, 21 passed")
+    return msgs
+
+
+def test_manual_compress_records_the_trigger(no_llm):
+    eng = make_engine()
+    out = eng.compress(session(fix_the_build(), long_session(30, output_chars=800)), force=True)
+    text = summary_of(eng, out)
+    assert "## Compaction Trigger" in text
+    assert "The user ran `/compress`" in text
+    assert "no LLM call" in text
+    assert no_llm == []  # recording the trigger costs no model call
+
+
+def test_the_handoff_is_still_byte_reproducible(no_llm):
+    """The same turns must still project to identical bytes (no clock, no duration in the text).
+
+    Two engines, one turn list: a second pass on the SAME engine legitimately differs, because
+    iterative compaction folds the previous summary into ``## Earlier Summary``.
+    """
+    turns = _prose_session()
+    assert make_engine()._generate_summary(list(turns)) == make_engine()._generate_summary(list(turns))
+    assert no_llm == []
+
+
+def test_automatic_pass_says_automatic(no_llm):
+    eng = make_engine()
+    eng._vcc_trigger = {"manual": False, "focus": None, "at": "2026-01-01 00:00:00"}
+    text = eng._generate_summary(_prose_session())
+    assert "Automatic: the context crossed the compaction threshold at 2026-01-01" in text
+    assert no_llm == []
+
+
+def test_record_trigger_off_restores_the_old_handoff(no_llm):
+    eng = make_engine(config={"context": {"vcc": {"record_trigger": False}}})
+    text = eng._generate_summary(_prose_session())
+    assert "## Compaction Trigger" not in text
+
+
+def test_conclusions_material_is_prose_only_and_bounded():
+    import projector
+
+    turns = _prose_session(rounds=30)
+    prose = projector.assistant_prose(turns)
+    assert len(prose) == 30 and all(m["role"] == "assistant" for m in prose)
+    material = projector.conclusions_material(turns, budget_chars=4000)
+    assert material, "expected some prose inside the budget"
+    assert sum(len(m["content"]) + 1 for m in material) <= 4000
+    assert len(material) < len(prose)  # the cap actually cut the selection
+    assert material[-1]["content"] == prose[-1]["content"]  # newest prose is always kept
+    assert all("tool_calls" not in m for m in material)     # tool traffic never reaches the leg
+
+
+def test_conclusions_leg_defaults_off_and_costs_no_llm(no_llm):
+    eng = make_engine()
+    assert eng._vcc_options["preserve_conclusions"] is False
+    out = eng.compress(session(fix_the_build(), long_session(30, output_chars=800)), force=True)
+    assert "## What the Agent Concluded" not in summary_of(eng, out)
+    assert no_llm == []
+
+
+def test_conclusions_leg_appends_the_digest(monkeypatch, no_llm):
+    import engine
+
+    seen: dict[str, int] = {}
+
+    def fake_llm_summary(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
+        seen["turns"] = len(turns)
+        return "Decided the failing tests were an environment guard, not a regression."
+
+    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", fake_llm_summary)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    eng._vcc_trigger = {"manual": True, "focus": None, "at": "2026-01-01 00:00:00"}
+    text = eng._generate_summary(_prose_session())
+    assert "## What the Agent Concluded" in text
+    assert "environment guard" in text
+    assert seen["turns"] > 0
+    # the trigger line stops claiming "no LLM call" once the hybrid leg ran
+    assert "one bounded summary-model call" in text
+
+
+def test_conclusions_leg_strips_the_stock_handoff_banner(monkeypatch, no_llm):
+    """The digest is a SECTION of a handoff; it must not carry a second handoff banner."""
+    import agent.context_compressor as cc
+    import engine
+
+    def llm_with_banner(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
+        return cc.SUMMARY_PREFIX + "\nThe guard failures were environmental; the patch stands."
+
+    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", llm_with_banner)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    text = eng._generate_summary(_prose_session())
+    assert "the patch stands" in text
+    assert text.count(cc.SUMMARY_PREFIX.split("\n")[0]) == 1  # only the real handoff banner, up top
+
+
+def test_conclusions_leg_refuses_hermess_structural_fallback(monkeypatch, no_llm):
+    """A refused summariser (oMLX 507 memory ceiling) inserts a structural summary, not a model's.
+
+    Shipping that as a "conclusion" restates the projection we already have and charges the
+    leg's latency for nothing, so the section must be dropped and the trigger must stop
+    claiming a model ran.
+    """
+    import engine
+
+    def structural(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
+        self._last_summary_error = ("summary model stalled on every route; "
+                                    "deterministic fallback summary inserted")
+        return "## Historical Task Snapshot None. # Detailed Session Log (oldest first) …"
+
+    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", structural)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    eng._vcc_trigger = {"manual": True, "focus": None, "at": "2026-01-01 00:00:00"}
+    text = eng._generate_summary(_prose_session())
+    assert "## What the Agent Concluded" not in text
+    assert "no LLM call" in text
+    assert "## Detailed Session Log" in text  # the deterministic projection still shipped
+
+
+def test_conclusions_leg_failure_ships_the_deterministic_handoff(monkeypatch, no_llm):
+    import engine
+
+    def explode(self, turns, focus_topic=None, memory_context="", bypass_cooldown=False):
+        raise RuntimeError("aux model is down")
+
+    monkeypatch.setattr(engine.ContextCompressor, "_generate_summary", explode)
+    eng = make_engine(config={"context": {"vcc": {"preserve_conclusions": True}}})
+    text = eng._generate_summary(_prose_session())
+    assert "## What the Agent Concluded" not in text
+    assert "## Detailed Session Log" in text  # the projection still shipped
